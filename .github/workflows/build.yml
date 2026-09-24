@@ -1,0 +1,52 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    # Pinned: the project and its dependency builds target the VS 2022 (v143) toolset.
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      # wxWidgets + Boost take ~20+ min to build, so they are cached separately.
+      # Restore/save are split so the cache survives even if a later step fails.
+      - name: Restore dependency cache
+        id: deps-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: C:\dev\external
+          key: deps-${{ hashFiles('ci/deps.ps1') }}
+
+      - name: Build dependencies (wxWidgets 3.2.11, Boost 1.86)
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./ci/deps.ps1
+
+      - name: Save dependency cache
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: C:\dev\external
+          key: deps-${{ hashFiles('ci/deps.ps1') }}
+
+      - name: Build TouchCursor (Debug + Release)
+        shell: pwsh
+        run: ./ci/build.ps1
+
+      - name: Run built-in self-tests
+        timeout-minutes: 5
+        shell: pwsh
+        run: ./ci/test.ps1
+
+      - name: Package release binaries
+        shell: pwsh
+        run: ./ci/package.ps1
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: TouchCursor-1.7.1-punto-compat
+          path: dist/
