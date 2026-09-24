@@ -143,8 +143,20 @@ namespace test {
 
 namespace {
 
-    bool injectedByUs(const KBDLLHOOKSTRUCT* h) {
-        return h->flags & LLKHF_INJECTED && h->dwExtraInfo == injectedFlag;
+    // True for every software-generated keystroke (SendInput/keybd_event),
+    // whether it came from TouchCursor itself or from another program.
+    //
+    // TouchCursor exists to reinterpret the user's *physical* key presses.
+    // Keystrokes synthesized by other tools are already final and must reach
+    // the application untouched. Example: Punto Switcher corrects a word by
+    // sending Backspaces and retyping it, typically while the user is still
+    // holding Space. Fed into the state machine, those keys were remapped
+    // (L -> Right, O -> End, ...) or interleaved with the held-back Space,
+    // producing caret jumps and stray letters.
+    // Our own events are still tagged with injectedFlag (handy when debugging),
+    // they are simply no longer the only ones skipped.
+    bool injectedBySoftware(const KBDLLHOOKSTRUCT* h) {
+        return (h->flags & LLKHF_INJECTED) != 0;
     }
 
     bool isExtendedKey(DWORD code) {
@@ -555,13 +567,15 @@ namespace {
         hadKeypressSinceLastTick = true;
         if (nCode >= 0) {
             KBDLLHOOKSTRUCT* h = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+            // Deliberately tracks software-generated modifiers too: they change the
+            // real modifier state that our mapped keys get combined with.
             logModifierState(h->vkCode, isKeyDown(wParam));
 
             //wchar_t buff[100];
             //wsprintf(buff, L"%x %x %x %x\n", h->vkCode, h->scanCode, h->flags, h->dwExtraInfo);
             //OutputDebugString(buff);
 
-            if (!injectedByUs(h)) {
+            if (!injectedBySoftware(h)) {
                 wchar_t exeName[MAX_PATH];
                 win32funcs::GetWindowExeName(exeName, MAX_PATH, GetForegroundWindow());
 
@@ -672,6 +686,13 @@ namespace test {
     const DWORD DEL = VK_DELETE;
     const DWORD F5 = configKey;
     const DWORD ctrl = VK_CONTROL;
+    const DWORD l = L'L';
+    const DWORD BK = VK_BACK;
+    // Software-generated (injected) events, as sent by e.g. Punto Switcher.
+    // Expected output of a passed-through injected key-down is (key, inj);
+    // for key-ups the usual "up" expectation matches.
+    const DWORD inj = LLKHF_INJECTED;
+    const DWORD injup = LLKHF_INJECTED | LLKHF_UP;
 
     int failures = 0;
 
@@ -684,7 +705,7 @@ namespace test {
     void check(DWORD key, DWORD flag, DWORD expected, ...) {
         
         KBDLLHOOKSTRUCT h = {key, 0, flag, 0, 0};
-        LowLevelKeyboardProc(HC_ACTION, flag==dn ? WM_KEYDOWN : WM_KEYUP, reinterpret_cast<LPARAM>(&h));
+        LowLevelKeyboardProc(HC_ACTION, (flag==dn || flag==inj) ? WM_KEYDOWN : WM_KEYUP, reinterpret_cast<LPARAM>(&h));
 
         DWORD e = expected;
         va_list marker;
@@ -707,6 +728,7 @@ namespace test {
                         wsprintf(buff, L"%s (%i) : Key mismatch: Expected 0x%x ('%c'), got 0x%x ('%c')\n", file, line, e, e, *actual, *actual);
                     }
                     OutputDebugString(buff);
+                    fputws(buff, stderr);
                     ++failures;
                 }
                 ++actual;
@@ -716,6 +738,7 @@ namespace test {
         if (*actual) {
             wsprintf(buff, L"%s (%i) : Unexpected extra output: 0x%x ('%c')\n", file, line, *actual, *actual);            
             OutputDebugString(buff);
+            fputws(buff, stderr);
             ++failures;
         }
         va_end(marker);
@@ -912,6 +935,40 @@ namespace test {
             CHECK((ctrl,up, ctrl,dn, c,dn, c,up, ctrl,up, 0));
             CHECK((SP,up,   ctrl,dn, c,dn, c,up, ctrl,up, 0));
 
+            // Software-generated keys while Space is held (the Punto Switcher case:
+            // it erases and retypes a word as the user presses Space). They must
+            // pass through untouched, and the held Space must still come out as a
+            // normal tap afterwards.
+            resetOutput();
+            CHECK((SP, dn,    0));
+            CHECK((BK, inj,   BK,inj, 0));
+            CHECK((BK, injup, BK,inj, BK,up, 0));
+            CHECK((l, inj,    BK,inj, BK,up, l,inj, 0));
+            CHECK((l, injup,  BK,inj, BK,up, l,inj, l,up, 0));
+            CHECK((SP, up,    BK,inj, BK,up, l,inj, l,up, SP,dn, SP,up, 0));
+
+            // Software-generated keys in the middle of cursor mode are not mapped
+            // and do not disturb it: a physical J still maps to Left afterwards.
+            resetOutput();
+            CHECK((SP, dn,    0));
+            CHECK((j, dn,     0));
+            CHECK((j, up,     LE,edn, LE,up, 0));
+            CHECK((l, inj,    LE,edn, LE,up, l,inj, 0));
+            CHECK((l, injup,  LE,edn, LE,up, l,inj, l,up, 0));
+            CHECK((j, dn,     LE,edn, LE,up, l,inj, l,up, LE,edn, 0));
+            CHECK((j, up,     LE,edn, LE,up, l,inj, l,up, LE,edn, LE,up, 0));
+            CHECK((SP, up,    LE,edn, LE,up, l,inj, l,up, LE,edn, LE,up, 0));
+
+            // A software-generated Space does not activate cursor mode, and
+            // physical typing afterwards is unaffected.
+            resetOutput();
+            CHECK((SP, inj,   SP,inj, 0));
+            CHECK((l, inj,    SP,inj, l,inj, 0));
+            CHECK((l, injup,  SP,inj, l,inj, l,up, 0));
+            CHECK((SP, injup, SP,inj, l,inj, l,up, SP,up, 0));
+            CHECK((x, dn,     SP,inj, l,inj, l,up, SP,up, x,dn, 0));
+            CHECK((x, up,     SP,inj, l,inj, l,up, SP,up, x,dn, x,up, 0));
+
             // training mode
             options.trainingMode = true;
             options.beepForMistakes = false;
@@ -930,8 +987,17 @@ namespace test {
             CHECK((ctrl, up, c,dn, c,up, ctrl,dn, ctrl,up, 0));
 
             SM.printUnusedTransitions();
-            if (failures) exit(failures);
-            else OutputDebugString(L"Unit tests passed\n");
+            // Also report to the console, so an automated build can see the result.
+            if (failures) {
+                fwprintf(stderr, L"Unit tests FAILED: %d failure(s)\n", failures);
+                fflush(stderr);
+                exit(failures);
+            }
+            else {
+                OutputDebugString(L"Unit tests passed\n");
+                fputws(L"Unit tests passed\n", stdout);
+                fflush(stdout);
+            }
 
             options = oldOptions;
             isInUnitTest = false;
